@@ -1,17 +1,18 @@
 use std::{
-    cell::RefCell,
-    collections::HashMap,
     fs::File,
     io::Write,
-    sync::{Arc, RwLock},
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
 };
 
+use bincode;
 use clickhouse::Client;
+use dashmap::DashMap;
 use futures_util::FutureExt;
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
-use solana_sdk::{message::VersionedMessage, pubkey::Pubkey};
 use solana_sdk::{message::VersionedMessage, pubkey::Pubkey};
 
 use crate::{
@@ -19,15 +20,14 @@ use crate::{
     bridge::{Block, Transaction},
 };
 
-thread_local! {
-    static ACCOUNT_SLOTS: RefCell<HashMap<Pubkey, u64>> = RefCell::new(HashMap::new());
-}
-
-// Global storage for collecting data from all threads
-static GLOBAL_ACCOUNT_SLOTS: Lazy<Arc<RwLock<HashMap<Pubkey, u64>>>> = 
-    Lazy::new(|| Arc::new(RwLock::new(HashMap::new())));
+// High-performance concurrent HashMap using internal sharding
+// Multiple threads can write to different shards simultaneously!
+static ACCOUNT_SLOTS: Lazy<DashMap<Pubkey, u64>> = Lazy::new(|| DashMap::new());
 
 static SHOULD_SAVE_ON_EXIT: AtomicBool = AtomicBool::new(true);
+
+// Store the end slot for detecting when processing is complete
+static END_SLOT: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct AccountSlotEntry {
@@ -39,85 +39,96 @@ pub struct AccountSlotEntry {
 pub struct AccountSlotTrackingPlugin;
 
 impl AccountSlotTrackingPlugin {
-    /// Flushes thread-local data to global storage
-    pub fn flush_thread_local_data() {
-        Self::extract_local_data()
-            .and_then(Self::update_global_storage)
-            .map(|_| Self::clear_local_storage())
-            .unwrap_or_else(|e| log::debug!("Flush skipped: {}", e));
-    }
-    
-    fn extract_local_data() -> Result<Vec<(Pubkey, u64)>, &'static str> {
-        ACCOUNT_SLOTS.with(|slots| {
-            let slots = slots.borrow();
-            if slots.is_empty() {
-                Err("No local data to flush")
-            } else {
-                Ok(slots.iter().map(|(&account, &slot)| (account, slot)).collect())
-            }
-        })
-    }
-    
-    fn update_global_storage(data: Vec<(Pubkey, u64)>) -> Result<(), &'static str> {
-        let mut global_slots = GLOBAL_ACCOUNT_SLOTS.write()
-            .map_err(|_| "Failed to acquire write lock")?;
-            
-        for (account, slot) in data {
-            global_slots.entry(account)
-                .and_modify(|current| *current = (*current).max(slot))
-                .or_insert(slot);
+    /// Parse slot range from command line arguments (same logic as main app)
+    fn parse_slot_range_from_args() -> Option<std::ops::Range<u64>> {
+        let first_arg = std::env::args().nth(1)?;
+
+        if first_arg.contains(':') {
+            let (slot_a, slot_b) = first_arg.split_once(':')?;
+            let slot_a: u64 = slot_a.parse().ok()?;
+            let slot_b: u64 = slot_b.parse().ok()?;
+            Some(slot_a..(slot_b + 1))
+        } else {
+            let _epoch: u64 = first_arg.parse().ok()?;
+            // Note: This would require importing geyser_replay::epochs
+            // For now, we'll just return None for epoch-based ranges
+            log::warn!("Epoch-based slot ranges not supported for end-slot detection");
+            None
         }
-        Ok(())
-    }
-    
-    fn clear_local_storage() {
-        ACCOUNT_SLOTS.with(|slots| slots.borrow_mut().clear());
     }
 
-    /// Collects all account slot data from all threads and returns it sorted by slot (descending)
-    pub fn collect_and_sort_data() -> Vec<AccountSlotEntry> {
-        // First, flush any remaining thread-local data
-        Self::flush_thread_local_data();
-        
-        let mut entries = Vec::new();
-        
-        if let Ok(global_slots) = GLOBAL_ACCOUNT_SLOTS.read() {
-            for (&account, &highest_slot) in global_slots.iter() {
-                entries.push(AccountSlotEntry {
-                    account,
-                    highest_slot,
-                });
+    /// Initialize the end slot from command line arguments
+    fn initialize_end_slot() {
+        if let Some(range) = Self::parse_slot_range_from_args() {
+            let end_slot = range.end - 1; // Convert from exclusive to inclusive end
+            END_SLOT.store(end_slot, Ordering::SeqCst);
+            log::info!("🎯 Will save data when reaching end slot: {}", end_slot);
+        } else {
+            log::warn!("Could not determine end slot from command line arguments");
+        }
+    }
+
+    /// Check if we've reached the end slot and save data if so
+    fn check_and_save_if_complete(slot: u64) {
+        let mut end_slot = END_SLOT.load(Ordering::SeqCst);
+        if end_slot == 0 {
+            log::info!("No end slot, initializing end slot from args range");
+            Self::initialize_end_slot();
+            end_slot = END_SLOT.load(Ordering::SeqCst);
+        }
+
+        if end_slot > 0 && slot >= end_slot {
+            log::info!("🏁 Reached end slot {}, saving final data...", end_slot);
+            if let Err(e) = Self::save_to_disk("account_slots_final.bin") {
+                log::error!("❌ Failed to save final data: {}", e);
+            } else {
+                log::info!("✅ Successfully saved final account slot data!");
             }
         }
+    }
+
+    /// Collects all account slot data and returns it sorted by slot (descending)
+    pub fn collect_and_sort_data() -> Vec<AccountSlotEntry> {
+        // DashMap provides a simple iterator over all key-value pairs
+        let entries: Vec<AccountSlotEntry> = ACCOUNT_SLOTS
+            .iter()
+            .map(|entry| AccountSlotEntry {
+                account: *entry.key(),
+                highest_slot: *entry.value(),
+            })
+            .collect();
 
         // Sort by highest_slot in descending order
-        entries.sort_by(|a, b| b.highest_slot.cmp(&a.highest_slot));
-        entries
+        let mut sorted_entries = entries;
+        sorted_entries.sort_by(|a, b| b.highest_slot.cmp(&a.highest_slot));
+        sorted_entries
     }
-    
+
     /// Saves the account slot data to disk in the specified format
     pub fn save_to_disk(filename: &str) -> Result<(), Box<dyn std::error::Error>> {
         let data = Self::collect_and_sort_data();
-        let mut file = File::create(filename)?;
-        
-        // Write as JSON for readability, could also use bincode for efficiency
-        let json_data = serde_json::to_string_pretty(&data)?;
-        file.write_all(json_data.as_bytes())?;
-        
-        log::info!("Saved {} account slot entries to {}", data.len(), filename);
+
+        // Get absolute path for debugging
+        let absolute_path = std::env::current_dir()?.join(filename);
+        let mut file = File::create(&absolute_path)?;
+
+        // Use bincode for efficient binary serialization
+        let binary_data = bincode::serialize(&data)?;
+        file.write_all(&binary_data)?;
+
+        log::info!(
+            "✅ Saved {} account slot entries to {} ({} bytes)",
+            data.len(),
+            absolute_path.display(),
+            binary_data.len()
+        );
+        eprintln!(
+            "✅ Saved {} account slot entries to {} ({} bytes)",
+            data.len(),
+            absolute_path.display(),
+            binary_data.len()
+        );
         Ok(())
-    }
-    
-    /// Periodically flush thread-local data to global storage
-    /// Call this occasionally to prevent excessive memory usage in thread-local storage
-    pub fn periodic_flush() {
-        ACCOUNT_SLOTS.with(|local_slots| {
-            let local_len = local_slots.borrow().len();
-            // Flush when we have accumulated a significant amount of data
-            if local_len > 10000 {
-                Self::flush_thread_local_data();
-            }
-        });
     }
 }
 
@@ -139,25 +150,26 @@ impl Plugin for AccountSlotTrackingPlugin {
                 VersionedMessage::Legacy(ref msg) => &msg.account_keys,
                 VersionedMessage::V0(ref msg) => &msg.account_keys,
             };
-            
-            let slot = transaction.slot;
-            
-            // Update the highest slot for each account in this transaction
-            ACCOUNT_SLOTS.with(|slots| {
-                let mut slots = slots.borrow_mut();
-                for &account in account_keys {
-                    slots.entry(account)
-                        .and_modify(|current_slot| {
-                            if slot > *current_slot {
-                                *current_slot = slot;
-                            }
-                        })
-                        .or_insert(slot);
-                }
-            });
 
-            // Periodically flush to prevent excessive memory usage
-            Self::periodic_flush();
+            let slot = transaction.slot;
+            log::debug!(
+                "📦 Processing transaction at slot {} with {} accounts",
+                slot,
+                account_keys.len()
+            );
+
+            // Update the highest slot for each account in this transaction
+            // DashMap allows concurrent updates to different keys without blocking!
+            for &account in account_keys {
+                ACCOUNT_SLOTS
+                    .entry(account)
+                    .and_modify(|current_slot| {
+                        if slot > *current_slot {
+                            *current_slot = slot;
+                        }
+                    })
+                    .or_insert(slot);
+            }
 
             Ok(())
         }
@@ -165,14 +177,28 @@ impl Plugin for AccountSlotTrackingPlugin {
     }
 
     #[inline(always)]
-    fn on_block(&self, _: Arc<Client>, _: Block) -> PluginFuture<'_> {
-        async move { Ok(()) }.boxed()
+    fn on_block(&self, _: Arc<Client>, block: Block) -> PluginFuture<'_> {
+        async move {
+            // Check if we've reached the end slot and save data if so
+            Self::check_and_save_if_complete(block.slot);
+            Ok(())
+        }
+        .boxed()
     }
 
     #[inline(always)]
     fn on_load(&self, _db: Arc<Client>) -> PluginFuture<'_> {
         async move {
-            log::info!("Account Slot Tracking Plugin loaded.");
+            log::info!("🔧 Account Slot Tracking Plugin loaded and ready!");
+
+            // Initialize the end slot from command line args
+            Self::initialize_end_slot();
+
+            // Test save immediately to verify it works
+            if let Err(e) = Self::save_to_disk("account_slots_initial.bin") {
+                log::warn!("Failed to create initial save file: {}", e);
+            }
+
             Ok(())
         }
         .boxed()
@@ -182,12 +208,9 @@ impl Plugin for AccountSlotTrackingPlugin {
     fn on_exit(&self, _db: Arc<Client>) -> PluginFuture<'_> {
         async move {
             log::info!("Account Slot Tracking Plugin unloading...");
-            
-            // Ensure all thread-local data is flushed before saving
-            Self::flush_thread_local_data();
-            
+
             if SHOULD_SAVE_ON_EXIT.load(Ordering::Relaxed) {
-                if let Err(e) = Self::save_to_disk("account_slots.json") {
+                if let Err(e) = Self::save_to_disk("account_slots.bin") {
                     log::error!("Failed to save account slot data: {}", e);
                 } else {
                     log::info!("Account slot data saved successfully.");

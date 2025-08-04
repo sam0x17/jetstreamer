@@ -64,7 +64,7 @@ use crossbeam_channel::{Receiver, Sender, bounded};
 use jetstreamer_plugin::ipc::spawn_socket_server;
 
 #[cfg(not(feature = "plugin-runner"))]
-use jetstreamer_plugin::{Plugin, plugins::program_tracking::ProgramTrackingPlugin};
+use jetstreamer_plugin::{Plugin, plugins::program_tracking::AccountSlotTrackingPlugin};
 
 thread_local! {
     static TOKIO_RUNTIME: RefCell<Runtime> = RefCell::new(Runtime::new().unwrap());
@@ -73,7 +73,7 @@ thread_local! {
             .with_option("async_insert", "1")
             .with_option("wait_for_async_insert", "0")));
     #[cfg(not(feature = "plugin-runner"))]
-    static PLUGIN: RefCell<ProgramTrackingPlugin> = const { RefCell::new(ProgramTrackingPlugin) };
+    static PLUGIN: RefCell<AccountSlotTrackingPlugin> = const { RefCell::new(AccountSlotTrackingPlugin) };
 }
 #[cfg(feature = "plugin-runner")]
 static IPC_SENDERS: once_cell::sync::OnceCell<Vec<Sender<JetstreamerMessage>>> =
