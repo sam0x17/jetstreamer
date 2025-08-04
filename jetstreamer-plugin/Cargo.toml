@@ -9,6 +9,7 @@ solana-logger.workspace = true
 solana-system-program.workspace = true
 solana-vote-program.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 solana-sdk.workspace = true
 tokio.workspace = true
 interprocess.workspace = true

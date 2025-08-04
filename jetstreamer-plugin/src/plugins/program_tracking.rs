@@ -1,8 +1,17 @@
-use std::{cell::RefCell, collections::HashMap, sync::Arc};
+use std::{
+    cell::RefCell,
+    collections::HashMap,
+    fs::File,
+    io::Write,
+    sync::{Arc, RwLock},
+    sync::atomic::{AtomicBool, Ordering},
+};
 
-use clickhouse::{Client, Row};
+use clickhouse::Client;
 use futures_util::FutureExt;
+use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
+use solana_sdk::{message::VersionedMessage, pubkey::Pubkey};
 use solana_sdk::{message::VersionedMessage, pubkey::Pubkey};
 
 use crate::{
@@ -11,38 +20,111 @@ use crate::{
 };
 
 thread_local! {
-    static DATA: RefCell<HashMap<u64, HashMap<Pubkey, ProgramStats>>> = RefCell::new(HashMap::new());
+    static ACCOUNT_SLOTS: RefCell<HashMap<Pubkey, u64>> = RefCell::new(HashMap::new());
 }
 
-#[derive(Row, Deserialize, Serialize, Copy, Clone, Debug, PartialEq, Eq, Hash)]
-struct ProgramEvent {
-    pub slot: u32,
-    // Stored as ClickHouse DateTime('UTC') -> UInt32 seconds; we clamp Solana i64.
-    pub timestamp: u32,
-    pub program_id: Pubkey,
-    pub count: u32,
-    pub error_count: u32,
-    pub min_cus: u32,
-    pub max_cus: u32,
-    pub total_cus: u32,
-}
+// Global storage for collecting data from all threads
+static GLOBAL_ACCOUNT_SLOTS: Lazy<Arc<RwLock<HashMap<Pubkey, u64>>>> = 
+    Lazy::new(|| Arc::new(RwLock::new(HashMap::new())));
 
-#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
-struct ProgramStats {
-    pub count: u32,
-    pub error_count: u32,
-    pub min_cus: u32,
-    pub max_cus: u32,
-    pub total_cus: u32,
+static SHOULD_SAVE_ON_EXIT: AtomicBool = AtomicBool::new(true);
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct AccountSlotEntry {
+    pub account: Pubkey,
+    pub highest_slot: u64,
 }
 
 #[derive(Debug, Default, Clone)]
-pub struct ProgramTrackingPlugin;
+pub struct AccountSlotTrackingPlugin;
 
-impl Plugin for ProgramTrackingPlugin {
+impl AccountSlotTrackingPlugin {
+    /// Flushes thread-local data to global storage
+    pub fn flush_thread_local_data() {
+        Self::extract_local_data()
+            .and_then(Self::update_global_storage)
+            .map(|_| Self::clear_local_storage())
+            .unwrap_or_else(|e| log::debug!("Flush skipped: {}", e));
+    }
+    
+    fn extract_local_data() -> Result<Vec<(Pubkey, u64)>, &'static str> {
+        ACCOUNT_SLOTS.with(|slots| {
+            let slots = slots.borrow();
+            if slots.is_empty() {
+                Err("No local data to flush")
+            } else {
+                Ok(slots.iter().map(|(&account, &slot)| (account, slot)).collect())
+            }
+        })
+    }
+    
+    fn update_global_storage(data: Vec<(Pubkey, u64)>) -> Result<(), &'static str> {
+        let mut global_slots = GLOBAL_ACCOUNT_SLOTS.write()
+            .map_err(|_| "Failed to acquire write lock")?;
+            
+        for (account, slot) in data {
+            global_slots.entry(account)
+                .and_modify(|current| *current = (*current).max(slot))
+                .or_insert(slot);
+        }
+        Ok(())
+    }
+    
+    fn clear_local_storage() {
+        ACCOUNT_SLOTS.with(|slots| slots.borrow_mut().clear());
+    }
+
+    /// Collects all account slot data from all threads and returns it sorted by slot (descending)
+    pub fn collect_and_sort_data() -> Vec<AccountSlotEntry> {
+        // First, flush any remaining thread-local data
+        Self::flush_thread_local_data();
+        
+        let mut entries = Vec::new();
+        
+        if let Ok(global_slots) = GLOBAL_ACCOUNT_SLOTS.read() {
+            for (&account, &highest_slot) in global_slots.iter() {
+                entries.push(AccountSlotEntry {
+                    account,
+                    highest_slot,
+                });
+            }
+        }
+
+        // Sort by highest_slot in descending order
+        entries.sort_by(|a, b| b.highest_slot.cmp(&a.highest_slot));
+        entries
+    }
+    
+    /// Saves the account slot data to disk in the specified format
+    pub fn save_to_disk(filename: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let data = Self::collect_and_sort_data();
+        let mut file = File::create(filename)?;
+        
+        // Write as JSON for readability, could also use bincode for efficiency
+        let json_data = serde_json::to_string_pretty(&data)?;
+        file.write_all(json_data.as_bytes())?;
+        
+        log::info!("Saved {} account slot entries to {}", data.len(), filename);
+        Ok(())
+    }
+    
+    /// Periodically flush thread-local data to global storage
+    /// Call this occasionally to prevent excessive memory usage in thread-local storage
+    pub fn periodic_flush() {
+        ACCOUNT_SLOTS.with(|local_slots| {
+            let local_len = local_slots.borrow().len();
+            // Flush when we have accumulated a significant amount of data
+            if local_len > 10000 {
+                Self::flush_thread_local_data();
+            }
+        });
+    }
+}
+
+impl Plugin for AccountSlotTrackingPlugin {
     #[inline(always)]
     fn name(&self) -> &'static str {
-        "Program Tracking"
+        "Account Slot Tracking"
     }
 
     #[inline(always)]
@@ -53,38 +135,29 @@ impl Plugin for ProgramTrackingPlugin {
         _tx_index: u32,
     ) -> PluginFuture<'_> {
         async move {
-            let (account_keys, instructions) = match transaction.tx.message {
-                VersionedMessage::Legacy(msg) => (msg.account_keys, msg.instructions),
-                VersionedMessage::V0(msg) => (msg.account_keys, msg.instructions),
+            let account_keys = match transaction.tx.message {
+                VersionedMessage::Legacy(ref msg) => &msg.account_keys,
+                VersionedMessage::V0(ref msg) => &msg.account_keys,
             };
-            let program_ids = instructions
-                .iter()
-                .map(|ix| account_keys[ix.program_id_index as usize])
-                .collect::<Vec<_>>();
-            let total_cu = transaction.cu.unwrap_or(0) as u32;
-
-            DATA.with(|data| {
-                let mut data = data.borrow_mut();
-                let slot_data = data.entry(transaction.slot).or_default();
-
-                for program_id in program_ids.iter() {
-                    let this_program_cu = total_cu / program_ids.len() as u32;
-                    let stats = slot_data.entry(*program_id).or_insert(ProgramStats {
-                        min_cus: u32::MAX,
-                        max_cus: 0,
-                        total_cus: 0,
-                        count: 0,
-                        error_count: 0,
-                    });
-                    stats.min_cus = stats.min_cus.min(this_program_cu);
-                    stats.max_cus = stats.max_cus.max(this_program_cu);
-                    stats.total_cus += this_program_cu;
-                    stats.count += 1;
-                    if !transaction.success {
-                        stats.error_count += 1;
-                    }
+            
+            let slot = transaction.slot;
+            
+            // Update the highest slot for each account in this transaction
+            ACCOUNT_SLOTS.with(|slots| {
+                let mut slots = slots.borrow_mut();
+                for &account in account_keys {
+                    slots.entry(account)
+                        .and_modify(|current_slot| {
+                            if slot > *current_slot {
+                                *current_slot = slot;
+                            }
+                        })
+                        .or_insert(slot);
                 }
             });
+
+            // Periodically flush to prevent excessive memory usage
+            Self::periodic_flush();
 
             Ok(())
         }
@@ -92,78 +165,14 @@ impl Plugin for ProgramTrackingPlugin {
     }
 
     #[inline(always)]
-    fn on_block(&self, db: Arc<Client>, block: Block) -> PluginFuture<'_> {
-        async move {
-            let mut rows = Vec::new();
-
-            DATA.with(|data| {
-                let mut data = data.borrow_mut();
-                if let Some(slot_data) = data.remove(&block.slot) {
-                    let raw_ts = block.block_time.unwrap_or(0);
-                    let timestamp: u32 = if raw_ts < 0 {
-                        0
-                    } else if raw_ts > u32::MAX as i64 {
-                        u32::MAX
-                    } else {
-                        raw_ts as u32
-                    };
-
-                    for (program_id, stats) in slot_data.iter() {
-                        rows.push(ProgramEvent {
-                            slot: block.slot as u32,
-                            program_id: *program_id,
-                            count: stats.count,
-                            error_count: stats.error_count,
-                            min_cus: stats.min_cus,
-                            max_cus: stats.max_cus,
-                            total_cus: stats.total_cus,
-                            timestamp,
-                        });
-                    }
-                }
-            });
-
-            if !rows.is_empty() {
-                let mut insert = db.insert("program_invocations")?;
-                for row in rows {
-                    insert.write(&row).await.unwrap();
-                }
-                insert.end().await.unwrap();
-            }
-
-            Ok(())
-        }
-        .boxed()
+    fn on_block(&self, _: Arc<Client>, _: Block) -> PluginFuture<'_> {
+        async move { Ok(()) }.boxed()
     }
 
     #[inline(always)]
-    fn on_load(&self, db: Arc<Client>) -> PluginFuture<'_> {
-        // Remove invalid `get_or_init` call in `on_load`
-        DATA.with(|_| {});
-        // SLOT_TIMESTAMPS is a Lazy global, nothing to initialize
+    fn on_load(&self, _db: Arc<Client>) -> PluginFuture<'_> {
         async move {
-            log::info!("Program Tracking Plugin loaded.");
-            log::info!("Creating program_invocations table if it does not exist...");
-            // Ensure table exists with native DateTime('UTC') timestamp column.
-            db.query(
-                r#"
-                CREATE TABLE IF NOT EXISTS program_invocations (
-                    slot        UInt32,
-                    timestamp   DateTime('UTC'),
-                    program_id  FixedString(32),
-                    count       UInt32,
-                    error_count UInt32,
-                    min_cus     UInt32,
-                    max_cus     UInt32,
-                    total_cus   UInt32
-                )
-                ENGINE = ReplacingMergeTree(slot)
-                ORDER BY (slot, program_id)
-                "#,
-            )
-            .execute()
-            .await?;
-            log::info!("done.");
+            log::info!("Account Slot Tracking Plugin loaded.");
             Ok(())
         }
         .boxed()
@@ -172,7 +181,19 @@ impl Plugin for ProgramTrackingPlugin {
     #[inline(always)]
     fn on_exit(&self, _db: Arc<Client>) -> PluginFuture<'_> {
         async move {
-            log::info!("Program Tracking Plugin unloading...");
+            log::info!("Account Slot Tracking Plugin unloading...");
+            
+            // Ensure all thread-local data is flushed before saving
+            Self::flush_thread_local_data();
+            
+            if SHOULD_SAVE_ON_EXIT.load(Ordering::Relaxed) {
+                if let Err(e) = Self::save_to_disk("account_slots.json") {
+                    log::error!("Failed to save account slot data: {}", e);
+                } else {
+                    log::info!("Account slot data saved successfully.");
+                }
+            }
+
             Ok(())
         }
         .boxed()

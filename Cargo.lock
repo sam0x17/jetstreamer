@@ -3184,6 +3184,7 @@ dependencies = [
  "rayon",
  "reqwest 0.12.23",
  "serde",
+ "serde_json",
  "sha2 0.10.9",
  "solana-logger",
  "solana-sdk",
