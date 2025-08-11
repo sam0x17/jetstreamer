@@ -79,7 +79,7 @@ impl AccountSlotTrackingPlugin {
 
         if (end_slot > 0 && slot >= end_slot) || (slot % 100000 == 0) {
             log::info!("🏁 Reached end slot {}, saving final data...", end_slot);
-            if let Err(e) = Self::save_to_disk(&format!("account_slots_{slot}.bin")) {
+            if let Err(e) = Self::save_to_disk("account_slots.bin") {
                 log::error!("❌ Failed to save final data: {}", e);
             } else {
                 log::info!("✅ Successfully saved final account slot data!");
