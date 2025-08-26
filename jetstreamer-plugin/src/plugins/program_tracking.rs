@@ -2,7 +2,7 @@ use std::{
     fs::File,
     io::Write,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
@@ -22,12 +22,15 @@ use crate::{
 
 // High-performance concurrent HashMap using internal sharding
 // Multiple threads can write to different shards simultaneously!
-static ACCOUNT_SLOTS: Lazy<DashMap<Pubkey, u64>> = Lazy::new(|| DashMap::new());
+static ACCOUNT_SLOTS: Lazy<DashMap<Pubkey, u64>> = Lazy::new(DashMap::new);
 
 static SHOULD_SAVE_ON_EXIT: AtomicBool = AtomicBool::new(true);
 
 // Store the end slot for detecting when processing is complete
 static END_SLOT: AtomicU64 = AtomicU64::new(0);
+
+// Mutex to ensure only one thread can save to disk at a time
+static SAVE_MUTEX: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct AccountSlotEntry {
@@ -105,7 +108,15 @@ impl AccountSlotTrackingPlugin {
     }
 
     /// Saves the account slot data to disk in the specified format
+    /// Thread-safe: Uses a mutex to prevent concurrent writes to the same file
     pub fn save_to_disk(filename: &str) -> Result<(), Box<dyn std::error::Error>> {
+        // Acquire the save mutex to prevent race conditions between multiple threads
+        let _guard = SAVE_MUTEX
+            .lock()
+            .map_err(|e| format!("Failed to acquire save mutex: {}", e))?;
+
+        log::debug!("🔒 Acquired save mutex for file: {}", filename);
+
         let data = Self::collect_and_sort_data();
 
         // Get absolute path for debugging
@@ -128,6 +139,9 @@ impl AccountSlotTrackingPlugin {
             absolute_path.display(),
             binary_data.len()
         );
+
+        log::debug!("🔓 Released save mutex for file: {}", filename);
+        // Mutex guard is automatically dropped here
         Ok(())
     }
 }
