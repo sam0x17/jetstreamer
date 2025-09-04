@@ -211,6 +211,18 @@ impl AccountSlotTrackingPlugin {
                    data.len(), absolute_path.display(), binary_data.len());
         eprintln!("✅ Saved final results: {} entries to {} ({} bytes)", 
                   data.len(), absolute_path.display(), binary_data.len());
+        
+        // Debug: Try to immediately deserialize what we just wrote
+        match std::fs::read(&absolute_path) {
+            Ok(file_data) => {
+                match bincode::deserialize::<Vec<AccountActivityEntry>>(&file_data) {
+                    Ok(entries) => log::info!("🔍 Debug: ✅ Deserialization test passed, {} entries", entries.len()),
+                    Err(e) => log::error!("🔍 Debug: ❌ Deserialization test failed: {}", e),
+                }
+            },
+            Err(e) => log::error!("🔍 Debug: ❌ Failed to read file for test: {}", e),
+        }
+        
         Ok(())
     }
 }
