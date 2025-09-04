@@ -37,6 +37,7 @@ const CHECKPOINT_FILENAME: &str = "account_activity_checkpoint.bin";
 // Checkpointing state
 static CHECKPOINT_INTERVAL: AtomicU64 = AtomicU64::new(DEFAULT_CHECKPOINT_INTERVAL);
 static SAVE_MUTEX: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+static LAST_CHECKPOINT_SLOT: AtomicU64 = AtomicU64::new(0);
 
 /// Tracks the top 10 epochs for reads and writes, plus total counts
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -88,7 +89,6 @@ pub struct AccountActivityEntry {
     pub activity: AccountActivity,
 }
 
-
 #[derive(Debug, Default, Clone)]
 pub struct AccountSlotTrackingPlugin;
 
@@ -123,17 +123,31 @@ impl AccountSlotTrackingPlugin {
     }
 
     /// Check if we should create a checkpoint and do so if needed
+    /// Thread-safe: prevents multiple threads from writing the same checkpoint
     fn check_and_checkpoint(current_slot: u64) {
         let interval = CHECKPOINT_INTERVAL.load(Ordering::SeqCst);
 
-        // Use divisibility check instead of tracking last checkpoint slot
-        // This works correctly with multiple threads processing different ranges
+        // Use divisibility check for checkpoint intervals
         if current_slot % interval == 0 {
-            log::info!("💾 Creating checkpoint at slot {} (interval: {})", current_slot, interval);
-            if let Err(e) = Self::save_checkpoint(current_slot) {
-                log::error!("❌ Failed to create checkpoint: {}", e);
-            } else {
-                log::info!("✅ Checkpoint saved successfully");
+            // Atomic check-and-set to prevent duplicate checkpoints from multiple threads
+            let last_checkpoint = LAST_CHECKPOINT_SLOT.load(Ordering::SeqCst);
+            
+            // Only proceed if this slot hasn't been checkpointed yet
+            if current_slot > last_checkpoint {
+                // Try to claim this checkpoint slot atomically
+                if LAST_CHECKPOINT_SLOT.compare_exchange(
+                    last_checkpoint, 
+                    current_slot, 
+                    Ordering::SeqCst, 
+                    Ordering::SeqCst
+                ).is_ok() {
+                    log::info!("💾 Creating checkpoint at slot {} (interval: {})", current_slot, interval);
+                    if let Err(e) = Self::save_checkpoint(current_slot) {
+                        log::error!("❌ Failed to create checkpoint: {}", e);
+                    } else {
+                        log::info!("✅ Checkpoint saved successfully");
+                    }
+                }
             }
         }
     }
@@ -150,7 +164,7 @@ impl AccountSlotTrackingPlugin {
             .collect()
     }
     
-    /// Save checkpoint to disk
+    /// Save checkpoint to disk with atomic write to prevent corruption
     fn save_checkpoint(current_slot: u64) -> Result<(), Box<dyn std::error::Error>> {
         let _guard = SAVE_MUTEX.lock().map_err(|e| {
             format!("Failed to acquire save mutex: {}", e)
@@ -158,15 +172,23 @@ impl AccountSlotTrackingPlugin {
     
         let entries = Self::collect_data();
         let binary_data = bincode::serialize(&entries)?;
-        let mut file = File::create(CHECKPOINT_FILENAME)?;
+        
+        // Atomic write: write to temp file first, then rename
+        let temp_filename = format!("{}.tmp", CHECKPOINT_FILENAME);
+        let mut file = File::create(&temp_filename)?;
         file.write_all(&binary_data)?;
+        file.sync_all()?; // Ensure data is written to disk
+        drop(file); // Close file before rename
+        
+        // Atomic rename (on most filesystems)
+        std::fs::rename(&temp_filename, CHECKPOINT_FILENAME)?;
         
         log::debug!("💾 Saved checkpoint: {} entries, slot {}, {} bytes", 
                    entries.len(), current_slot, binary_data.len());
         Ok(())
     }
 
-    /// Save final results to a separate output file
+    /// Save final results to a separate output file with atomic write
     pub fn save_final_results(filename: &str) -> Result<(), Box<dyn std::error::Error>> {
         let _guard = SAVE_MUTEX.lock().map_err(|e| {
             format!("Failed to acquire save mutex: {}", e)
@@ -174,10 +196,16 @@ impl AccountSlotTrackingPlugin {
 
         let data = Self::collect_data();
         let absolute_path = std::env::current_dir()?.join(filename);
-        let mut file = File::create(&absolute_path)?;
-
+        let temp_path = std::env::current_dir()?.join(format!("{}.tmp", filename));
+        
         let binary_data = bincode::serialize(&data)?;
+        let mut file = File::create(&temp_path)?;
         file.write_all(&binary_data)?;
+        file.sync_all()?; // Ensure data is written to disk
+        drop(file); // Close file before rename
+        
+        // Atomic rename
+        std::fs::rename(&temp_path, &absolute_path)?;
 
         log::info!("✅ Saved final results: {} entries to {} ({} bytes)", 
                    data.len(), absolute_path.display(), binary_data.len());
@@ -252,7 +280,7 @@ impl Plugin for AccountSlotTrackingPlugin {
     fn on_block(&self, _: Arc<Client>, block: Block) -> PluginFuture<'_> {
         async move {
             // Check if we should create a checkpoint
-            Self::check_and_checkpoint(block.slot);
+            //Self::check_and_checkpoint(block.slot);
             Ok(())
         }
         .boxed()
