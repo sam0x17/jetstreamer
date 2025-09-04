@@ -20,128 +20,169 @@ use crate::{
     bridge::{Block, Transaction},
 };
 
-// High-performance concurrent HashMap using internal sharding
-// Multiple threads can write to different shards simultaneously!
-static ACCOUNT_SLOTS: Lazy<DashMap<Pubkey, u64>> = Lazy::new(DashMap::new);
+/// Convert slot number to epoch number (each epoch has 432,000 slots)
+#[inline(always)]
+const fn slot_to_epoch(slot: u64) -> u16 {
+    (slot / 432_000) as u16
+}
 
-static SHOULD_SAVE_ON_EXIT: AtomicBool = AtomicBool::new(true);
+// High-performance concurrent HashMap storing detailed account activity
+static ACCOUNT_ACTIVITY: Lazy<DashMap<Pubkey, AccountActivity>> = 
+    Lazy::new(|| DashMap::new());
 
-// Store the end slot for detecting when processing is complete
-static END_SLOT: AtomicU64 = AtomicU64::new(0);
+// Checkpointing configuration
+const DEFAULT_CHECKPOINT_INTERVAL: u64 = 50_000; // Save every 50k slots
+const CHECKPOINT_FILENAME: &str = "account_activity_checkpoint.bin";
 
-// Mutex to ensure only one thread can save to disk at a time
+// Checkpointing state
+static CHECKPOINT_INTERVAL: AtomicU64 = AtomicU64::new(DEFAULT_CHECKPOINT_INTERVAL);
 static SAVE_MUTEX: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct AccountSlotEntry {
-    pub account: Pubkey,
-    pub highest_slot: u64,
+/// Tracks the top 10 epochs for reads and writes, plus total counts
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct AccountActivity {
+    /// Top 10 highest epochs where this account was read from (sorted descending)
+    pub top_read_epochs: Vec<u16>,
+    /// Top 10 highest epochs where this account was written to (sorted descending) 
+    pub top_write_epochs: Vec<u16>,
+    /// Total number of read operations
+    pub read_count: u32,
+    /// Total number of write operations
+    pub write_count: u32,
 }
+
+impl AccountActivity {
+    /// Add a read epoch, maintaining top 10 sorted list
+    pub fn add_read_epoch(&mut self, epoch: u16) {
+        self.read_count += 1;
+        Self::add_epoch_to_list(&mut self.top_read_epochs, epoch);
+    }
+    
+    /// Add a write epoch, maintaining top 10 sorted list
+    pub fn add_write_epoch(&mut self, epoch: u16) {
+        self.write_count += 1;
+        Self::add_epoch_to_list(&mut self.top_write_epochs, epoch);
+    }
+    
+    /// Helper to maintain a sorted top-10 list of epochs
+    fn add_epoch_to_list(list: &mut Vec<u16>, epoch: u16) {
+        // If epoch already exists, don't add duplicate
+        if list.contains(&epoch) {
+            return;
+        }
+        
+        // Add epoch and keep sorted (descending)
+        list.push(epoch);
+        list.sort_by(|a, b| b.cmp(a));
+        
+        // Keep only top 10
+        if list.len() > 10 {
+            list.truncate(10);
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct AccountActivityEntry {
+    pub account: Pubkey,
+    pub activity: AccountActivity,
+}
+
 
 #[derive(Debug, Default, Clone)]
 pub struct AccountSlotTrackingPlugin;
 
 impl AccountSlotTrackingPlugin {
-    /// Parse slot range from command line arguments (same logic as main app)
-    fn parse_slot_range_from_args() -> Option<std::ops::Range<u64>> {
-        let first_arg = std::env::args().nth(1)?;
-
-        if first_arg.contains(':') {
-            let (slot_a, slot_b) = first_arg.split_once(':')?;
-            let slot_a: u64 = slot_a.parse().ok()?;
-            let slot_b: u64 = slot_b.parse().ok()?;
-            Some(slot_a..(slot_b + 1))
-        } else {
-            let _epoch: u64 = first_arg.parse().ok()?;
-            // Note: This would require importing geyser_replay::epochs
-            // For now, we'll just return None for epoch-based ranges
-            log::warn!("Epoch-based slot ranges not supported for end-slot detection");
-            None
-        }
+    /// Extract writable and readonly accounts from message header and account keys
+    /// Works for both Legacy and V0 messages since they have the same structure
+    fn extract_account_access(
+        header: &solana_sdk::message::MessageHeader,
+        account_keys: &[solana_sdk::pubkey::Pubkey],
+    ) -> (Vec<solana_sdk::pubkey::Pubkey>, Vec<solana_sdk::pubkey::Pubkey>) {
+        let num_required_signatures = header.num_required_signatures as usize;
+        let num_readonly_signed_accounts = header.num_readonly_signed_accounts as usize;
+        let num_readonly_unsigned_accounts = header.num_readonly_unsigned_accounts as usize;
+        
+        let writable_signed_end = num_required_signatures - num_readonly_signed_accounts;
+        let readonly_signed_end = num_required_signatures;
+        let writable_unsigned_end = account_keys.len() - num_readonly_unsigned_accounts;
+        
+        let mut writable = Vec::new();
+        let mut readonly = Vec::new();
+        
+        // Writable signed accounts
+        writable.extend_from_slice(&account_keys[0..writable_signed_end]);
+        // Read-only signed accounts
+        readonly.extend_from_slice(&account_keys[writable_signed_end..readonly_signed_end]);
+        // Writable unsigned accounts
+        writable.extend_from_slice(&account_keys[readonly_signed_end..writable_unsigned_end]);
+        // Read-only unsigned accounts
+        readonly.extend_from_slice(&account_keys[writable_unsigned_end..]);
+        
+        (writable, readonly)
     }
 
-    /// Initialize the end slot from command line arguments
-    fn initialize_end_slot() {
-        if let Some(range) = Self::parse_slot_range_from_args() {
-            let end_slot = range.end - 1; // Convert from exclusive to inclusive end
-            END_SLOT.store(end_slot, Ordering::SeqCst);
-            log::info!("🎯 Will save data when reaching end slot: {}", end_slot);
-        } else {
-            log::warn!("Could not determine end slot from command line arguments");
-        }
-    }
+    /// Check if we should create a checkpoint and do so if needed
+    fn check_and_checkpoint(current_slot: u64) {
+        let interval = CHECKPOINT_INTERVAL.load(Ordering::SeqCst);
 
-    /// Check if we've reached the end slot and save data if so
-    fn check_and_save_if_complete(slot: u64) {
-        let mut end_slot = END_SLOT.load(Ordering::SeqCst);
-        if end_slot == 0 {
-            log::info!("No end slot, initializing end slot from args range");
-            Self::initialize_end_slot();
-            end_slot = END_SLOT.load(Ordering::SeqCst);
-        }
-
-        if (end_slot > 0 && slot >= end_slot) || (slot % 100000 == 0) {
-            log::info!("🏁 Reached end slot {}, saving final data...", end_slot);
-            if let Err(e) = Self::save_to_disk("account_slots.bin") {
-                log::error!("❌ Failed to save final data: {}", e);
+        // Use divisibility check instead of tracking last checkpoint slot
+        // This works correctly with multiple threads processing different ranges
+        if current_slot % interval == 0 {
+            log::info!("💾 Creating checkpoint at slot {} (interval: {})", current_slot, interval);
+            if let Err(e) = Self::save_checkpoint(current_slot) {
+                log::error!("❌ Failed to create checkpoint: {}", e);
             } else {
-                log::info!("✅ Successfully saved final account slot data!");
+                log::info!("✅ Checkpoint saved successfully");
             }
         }
     }
 
-    /// Collects all account slot data and returns it sorted by slot (descending)
-    pub fn collect_and_sort_data() -> Vec<AccountSlotEntry> {
+    /// Collects all account activity data
+    pub fn collect_data() -> Vec<AccountActivityEntry> {
         // DashMap provides a simple iterator over all key-value pairs
-        let entries: Vec<AccountSlotEntry> = ACCOUNT_SLOTS
+        ACCOUNT_ACTIVITY
             .iter()
-            .map(|entry| AccountSlotEntry {
+            .map(|entry| AccountActivityEntry {
                 account: *entry.key(),
-                highest_slot: *entry.value(),
+                activity: entry.value().clone(),
             })
-            .collect();
-
-        // Sort by highest_slot in descending order
-        let mut sorted_entries = entries;
-        sorted_entries.sort_by(|a, b| b.highest_slot.cmp(&a.highest_slot));
-        sorted_entries
+            .collect()
+    }
+    
+    /// Save checkpoint to disk
+    fn save_checkpoint(current_slot: u64) -> Result<(), Box<dyn std::error::Error>> {
+        let _guard = SAVE_MUTEX.lock().map_err(|e| {
+            format!("Failed to acquire save mutex: {}", e)
+        })?;
+    
+        let entries = Self::collect_data();
+        let binary_data = bincode::serialize(&entries)?;
+        let mut file = File::create(CHECKPOINT_FILENAME)?;
+        file.write_all(&binary_data)?;
+        
+        log::debug!("💾 Saved checkpoint: {} entries, slot {}, {} bytes", 
+                   entries.len(), current_slot, binary_data.len());
+        Ok(())
     }
 
-    /// Saves the account slot data to disk in the specified format
-    /// Thread-safe: Uses a mutex to prevent concurrent writes to the same file
-    pub fn save_to_disk(filename: &str) -> Result<(), Box<dyn std::error::Error>> {
-        // Acquire the save mutex to prevent race conditions between multiple threads
-        let _guard = SAVE_MUTEX
-            .lock()
-            .map_err(|e| format!("Failed to acquire save mutex: {}", e))?;
+    /// Save final results to a separate output file
+    pub fn save_final_results(filename: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let _guard = SAVE_MUTEX.lock().map_err(|e| {
+            format!("Failed to acquire save mutex: {}", e)
+        })?;
 
-        log::debug!("🔒 Acquired save mutex for file: {}", filename);
-
-        let data = Self::collect_and_sort_data();
-
-        // Get absolute path for debugging
+        let data = Self::collect_data();
         let absolute_path = std::env::current_dir()?.join(filename);
         let mut file = File::create(&absolute_path)?;
 
-        // Use bincode for efficient binary serialization
         let binary_data = bincode::serialize(&data)?;
         file.write_all(&binary_data)?;
 
-        log::info!(
-            "✅ Saved {} account slot entries to {} ({} bytes)",
-            data.len(),
-            absolute_path.display(),
-            binary_data.len()
-        );
-        eprintln!(
-            "✅ Saved {} account slot entries to {} ({} bytes)",
-            data.len(),
-            absolute_path.display(),
-            binary_data.len()
-        );
-
-        log::debug!("🔓 Released save mutex for file: {}", filename);
-        // Mutex guard is automatically dropped here
+        log::info!("✅ Saved final results: {} entries to {} ({} bytes)", 
+                   data.len(), absolute_path.display(), binary_data.len());
+        eprintln!("✅ Saved final results: {} entries to {} ({} bytes)", 
+                  data.len(), absolute_path.display(), binary_data.len());
         Ok(())
     }
 }
@@ -160,29 +201,46 @@ impl Plugin for AccountSlotTrackingPlugin {
         _tx_index: u32,
     ) -> PluginFuture<'_> {
         async move {
-            let account_keys = match transaction.tx.message {
-                VersionedMessage::Legacy(ref msg) => &msg.account_keys,
-                VersionedMessage::V0(ref msg) => &msg.account_keys,
+            let slot = transaction.slot;
+            let epoch = slot_to_epoch(slot);
+            
+            // Extract account access information from the message
+            // Both Legacy and V0 messages have the same header structure and account_keys layout
+            let (writable_accounts, readonly_accounts) = match &transaction.tx.message {
+                VersionedMessage::Legacy(msg) => {
+                    Self::extract_account_access(&msg.header, &msg.account_keys)
+                },
+                VersionedMessage::V0(msg) => {
+                    Self::extract_account_access(&msg.header, &msg.account_keys)
+                }
             };
 
-            let slot = transaction.slot;
-            log::debug!(
-                "📦 Processing transaction at slot {} with {} accounts",
-                slot,
-                account_keys.len()
-            );
+            log::debug!("📦 Processing transaction at slot {} (epoch {}): {} writable, {} readonly accounts", 
+                       slot, epoch, writable_accounts.len(), readonly_accounts.len());
 
-            // Update the highest slot for each account in this transaction
-            // DashMap allows concurrent updates to different keys without blocking!
-            for &account in account_keys {
-                ACCOUNT_SLOTS
+            // Update account activity tracking
+            // Process writable accounts (write access)
+            for &account in &writable_accounts {
+                ACCOUNT_ACTIVITY
                     .entry(account)
-                    .and_modify(|current_slot| {
-                        if slot > *current_slot {
-                            *current_slot = slot;
-                        }
-                    })
-                    .or_insert(slot);
+                    .and_modify(|activity| activity.add_write_epoch(epoch))
+                    .or_insert_with(|| {
+                        let mut activity = AccountActivity::default();
+                        activity.add_write_epoch(epoch);
+                        activity
+                    });
+            }
+            
+            // Process readonly accounts (read access)
+            for &account in &readonly_accounts {
+                ACCOUNT_ACTIVITY
+                    .entry(account)
+                    .and_modify(|activity| activity.add_read_epoch(epoch))
+                    .or_insert_with(|| {
+                        let mut activity = AccountActivity::default();
+                        activity.add_read_epoch(epoch);
+                        activity
+                    });
             }
 
             Ok(())
@@ -193,8 +251,8 @@ impl Plugin for AccountSlotTrackingPlugin {
     #[inline(always)]
     fn on_block(&self, _: Arc<Client>, block: Block) -> PluginFuture<'_> {
         async move {
-            // Check if we've reached the end slot and save data if so
-            Self::check_and_save_if_complete(block.slot);
+            // Check if we should create a checkpoint
+            Self::check_and_checkpoint(block.slot);
             Ok(())
         }
         .boxed()
@@ -205,14 +263,6 @@ impl Plugin for AccountSlotTrackingPlugin {
         async move {
             log::info!("🔧 Account Slot Tracking Plugin loaded and ready!");
 
-            // Initialize the end slot from command line args
-            Self::initialize_end_slot();
-
-            // Test save immediately to verify it works
-            if let Err(e) = Self::save_to_disk("account_slots_initial.bin") {
-                log::warn!("Failed to create initial save file: {}", e);
-            }
-
             Ok(())
         }
         .boxed()
@@ -221,14 +271,13 @@ impl Plugin for AccountSlotTrackingPlugin {
     #[inline(always)]
     fn on_exit(&self, _db: Arc<Client>) -> PluginFuture<'_> {
         async move {
-            log::info!("Account Slot Tracking Plugin unloading...");
+            log::info!("🏁 Account Slot Tracking Plugin unloading...");
 
-            if SHOULD_SAVE_ON_EXIT.load(Ordering::Relaxed) {
-                if let Err(e) = Self::save_to_disk("account_slots.bin") {
-                    log::error!("Failed to save account slot data: {}", e);
-                } else {
-                    log::info!("Account slot data saved successfully.");
-                }
+            // Save final results to output file
+            if let Err(e) = Self::save_final_results("account_activity_final.bin") {
+                log::error!("❌ Failed to save final results: {}", e);
+            } else {
+                log::info!("✅ Final results saved successfully");
             }
 
             Ok(())
