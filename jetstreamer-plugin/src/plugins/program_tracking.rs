@@ -1,10 +1,7 @@
 use std::{
     fs::File,
     io::Write,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, AtomicU64, Ordering},
-    },
+    sync::{Arc, Mutex},
 };
 
 use bincode;
@@ -30,15 +27,8 @@ const fn slot_to_epoch(slot: u64) -> u16 {
 static ACCOUNT_ACTIVITY: Lazy<DashMap<Pubkey, AccountActivity>> = 
     Lazy::new(|| DashMap::new());
 
-// Checkpointing configuration
-const DEFAULT_CHECKPOINT_INTERVAL: u64 = 50_000; // Save every 50k slots
-const CHECKPOINT_FILENAME: &str = "account_activity_checkpoint.bin";
-
 // Checkpointing state
-static CHECKPOINT_INTERVAL: AtomicU64 = AtomicU64::new(DEFAULT_CHECKPOINT_INTERVAL);
 static SAVE_MUTEX: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
-static LAST_CHECKPOINT_SLOT: AtomicU64 = AtomicU64::new(0);
-
 /// Tracks the top 10 epochs for reads and writes, plus total counts
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct AccountActivity {
@@ -122,36 +112,6 @@ impl AccountSlotTrackingPlugin {
         (writable, readonly)
     }
 
-    /// Check if we should create a checkpoint and do so if needed
-    /// Thread-safe: prevents multiple threads from writing the same checkpoint
-    fn check_and_checkpoint(current_slot: u64) {
-        let interval = CHECKPOINT_INTERVAL.load(Ordering::SeqCst);
-
-        // Use divisibility check for checkpoint intervals
-        if current_slot % interval == 0 {
-            // Atomic check-and-set to prevent duplicate checkpoints from multiple threads
-            let last_checkpoint = LAST_CHECKPOINT_SLOT.load(Ordering::SeqCst);
-            
-            // Only proceed if this slot hasn't been checkpointed yet
-            if current_slot > last_checkpoint {
-                // Try to claim this checkpoint slot atomically
-                if LAST_CHECKPOINT_SLOT.compare_exchange(
-                    last_checkpoint, 
-                    current_slot, 
-                    Ordering::SeqCst, 
-                    Ordering::SeqCst
-                ).is_ok() {
-                    log::info!("💾 Creating checkpoint at slot {} (interval: {})", current_slot, interval);
-                    if let Err(e) = Self::save_checkpoint(current_slot) {
-                        log::error!("❌ Failed to create checkpoint: {}", e);
-                    } else {
-                        log::info!("✅ Checkpoint saved successfully");
-                    }
-                }
-            }
-        }
-    }
-
     /// Collects all account activity data
     pub fn collect_data() -> Vec<AccountActivityEntry> {
         // DashMap provides a simple iterator over all key-value pairs
@@ -162,30 +122,6 @@ impl AccountSlotTrackingPlugin {
                 activity: entry.value().clone(),
             })
             .collect()
-    }
-    
-    /// Save checkpoint to disk with atomic write to prevent corruption
-    fn save_checkpoint(current_slot: u64) -> Result<(), Box<dyn std::error::Error>> {
-        let _guard = SAVE_MUTEX.lock().map_err(|e| {
-            format!("Failed to acquire save mutex: {}", e)
-        })?;
-    
-        let entries = Self::collect_data();
-        let binary_data = bincode::serialize(&entries)?;
-        
-        // Atomic write: write to temp file first, then rename
-        let temp_filename = format!("{}.tmp", CHECKPOINT_FILENAME);
-        let mut file = File::create(&temp_filename)?;
-        file.write_all(&binary_data)?;
-        file.sync_all()?; // Ensure data is written to disk
-        drop(file); // Close file before rename
-        
-        // Atomic rename (on most filesystems)
-        std::fs::rename(&temp_filename, CHECKPOINT_FILENAME)?;
-        
-        log::debug!("💾 Saved checkpoint: {} entries, slot {}, {} bytes", 
-                   entries.len(), current_slot, binary_data.len());
-        Ok(())
     }
 
     /// Save final results to a separate output file with atomic write
@@ -289,10 +225,8 @@ impl Plugin for AccountSlotTrackingPlugin {
     }
 
     #[inline(always)]
-    fn on_block(&self, _: Arc<Client>, block: Block) -> PluginFuture<'_> {
+    fn on_block(&self, _: Arc<Client>, _: Block) -> PluginFuture<'_> {
         async move {
-            // Check if we should create a checkpoint
-            //Self::check_and_checkpoint(block.slot);
             Ok(())
         }
         .boxed()
@@ -313,8 +247,13 @@ impl Plugin for AccountSlotTrackingPlugin {
         async move {
             log::info!("🏁 Account Slot Tracking Plugin unloading...");
 
-            // Save final results to output file
-            if let Err(e) = Self::save_final_results("account_activity_final.bin") {
+            // Save final results to output file with timestamp
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let filename = format!("account_activity_final_{}.bin", timestamp);
+            if let Err(e) = Self::save_final_results(&filename) {
                 log::error!("❌ Failed to save final results: {}", e);
             } else {
                 log::info!("✅ Final results saved successfully");
