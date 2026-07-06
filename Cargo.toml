@@ -116,6 +116,10 @@ solana-sysvar.workspace = true
 solana-blake3-hasher.workspace = true
 solana-epoch-rewards-hasher.workspace = true
 solana-keccak-hasher.workspace = true
+solana-transaction.workspace = true
+bincode.workspace = true
+dashmap.workspace = true
+clickhouse.workspace = true
 
 [dev-dependencies]
 clickhouse.workspace = true
